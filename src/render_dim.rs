@@ -1,357 +1,480 @@
-pub mod r3d {
-    use bevy::{
-        core_pipeline::core_3d::Opaque3d,
-        pbr::{
-            DrawMesh, MeshPipeline, MeshPipelineKey, MeshUniform, SetMeshBindGroup,
-            SetMeshViewBindGroup, MAX_CASCADES_PER_LIGHT, MAX_DIRECTIONAL_LIGHTS,
-        },
-        prelude::*,
-        render::{
-            mesh::MeshVertexBufferLayout,
-            render_asset::RenderAssets,
-            render_phase::{DrawFunctions, RenderPhase, SetItemPipeline},
-            render_resource::{
-                BlendState, ColorTargetState, ColorWrites, CompareFunction, DepthBiasState,
-                DepthStencilState, FragmentState, FrontFace, MultisampleState, PipelineCache,
-                PolygonMode, PrimitiveState, PrimitiveTopology, RenderPipelineDescriptor,
-                ShaderDefVal, SpecializedMeshPipeline, SpecializedMeshPipelineError,
-                SpecializedMeshPipelines, StencilFaceState, StencilState, TextureFormat,
-                VertexState,
-            },
-            texture::BevyDefault,
-            view::{ExtractedView, Msaa, ViewTarget},
-        },
-    };
+use bevy::{
+    asset::Assets,
+    pbr::{NotShadowCaster, NotShadowReceiver},
+    prelude::*,
+    render::{
+        Extract,
+        mesh::{/*Indices,*/ Mesh, VertexAttributeValues},
+        Render,
+        render_phase::AddRenderCommand,
+        render_resource::PrimitiveTopology,
+        render_resource::Shader, view::{NoFrustumCulling, RenderLayers},
+    },
+};
+use bevy::asset::load_internal_asset;
+use bevy::pbr::TransmittedShadowReceiver;
+use bevy::render::batching::NoAutomaticBatching;
 
-    use crate::{DebugLinesConfig, RenderDebugLinesMesh, DEBUG_LINES_SHADER_HANDLE};
+use shapes::AddLines;
 
-    #[derive(Resource)]
-    pub(crate) struct DebugLinePipeline {
-        mesh_pipeline: MeshPipeline,
-        shader: Handle<Shader>,
-    }
-    impl FromWorld for DebugLinePipeline {
-        fn from_world(render_world: &mut World) -> Self {
-            DebugLinePipeline {
-                mesh_pipeline: render_world.get_resource::<MeshPipeline>().unwrap().clone(),
-                shader: DEBUG_LINES_SHADER_HANDLE.typed(),
-            }
-        }
-    }
+#[cfg(feature = "shapes")]
+pub use crate::shapes::DebugShapes;
 
-    impl SpecializedMeshPipeline for DebugLinePipeline {
-        type Key = (bool, MeshPipelineKey);
+#[cfg(feature = "shapes")]
+pub mod shapes;
 
-        fn specialize(
-            &self,
-            (depth_test, key): Self::Key,
-            layout: &MeshVertexBufferLayout,
-        ) -> Result<RenderPipelineDescriptor, SpecializedMeshPipelineError> {
-            let mut shader_defs = Vec::new();
-            shader_defs.push("LINES_3D".into());
-            shader_defs.push(ShaderDefVal::UInt(
-                "MAX_CASCADES_PER_LIGHT".to_string(),
-                MAX_CASCADES_PER_LIGHT as u32,
-            ));
-            shader_defs.push(ShaderDefVal::UInt(
-                "MAX_DIRECTIONAL_LIGHTS".to_string(),
-                MAX_DIRECTIONAL_LIGHTS as u32,
-            ));
-            if depth_test {
-                shader_defs.push("DEPTH_TEST_ENABLED".into());
-            }
+mod render_dim;
 
-            let (label, blend, depth_write_enabled);
-            if key.contains(MeshPipelineKey::BLEND_ALPHA) {
-                label = "transparent_mesh_pipeline".into();
-                blend = Some(BlendState::ALPHA_BLENDING);
-                // For the transparent pass, fragments that are closer will be alpha
-                // blended but their depth is not written to the depth buffer.
-                depth_write_enabled = false;
-            } else {
-                label = "opaque_mesh_pipeline".into();
-                blend = Some(BlendState::REPLACE);
-                // For the opaque and alpha mask passes, fragments that are closer
-                // will replace the current fragment value in the output and the depth is
-                // written to the depth buffer.
-                depth_write_enabled = true;
-            }
+// This module exists to "isolate" the `#[cfg]` attributes to this part of the
+// code. Otherwise, we would pollute the code with a lot of feature
+// gates-specific code.
+#[cfg(feature = "3d")]
+mod dim {
+    use bevy::{asset::Handle, render::mesh::Mesh};
+    pub(crate) use bevy::core_pipeline::core_3d::Opaque3d as Phase;
 
-            let vertex_buffer_layout = layout.get_layout(&[
-                Mesh::ATTRIBUTE_POSITION.at_shader_location(0),
-                Mesh::ATTRIBUTE_COLOR.at_shader_location(1),
-            ])?;
+    pub(crate) use crate::render_dim::r3d::{DebugLinePipeline, DrawDebugLines, queue};
 
-            let bind_group_layout = match key.msaa_samples() {
-                1 => vec![self.mesh_pipeline.view_layout.clone()],
-                _ => {
-                    shader_defs.push("MULTISAMPLED".into());
-                    vec![self.mesh_pipeline.view_layout_multisampled.clone()]
-                }
-            };
+    pub(crate) type MeshHandle = Handle<Mesh>;
 
-            let format = if key.contains(MeshPipelineKey::HDR) {
-                ViewTarget::TEXTURE_FORMAT_HDR
-            } else {
-                TextureFormat::bevy_default()
-            };
-
-            Ok(RenderPipelineDescriptor {
-                vertex: VertexState {
-                    shader: self.shader.clone_weak(),
-                    entry_point: "vertex".into(),
-                    shader_defs: shader_defs.clone(),
-                    buffers: vec![vertex_buffer_layout],
-                },
-                fragment: Some(FragmentState {
-                    shader: self.shader.clone_weak(),
-                    shader_defs,
-                    entry_point: "fragment".into(),
-                    targets: vec![Some(ColorTargetState {
-                        format,
-                        blend,
-                        write_mask: ColorWrites::ALL,
-                    })],
-                }),
-                layout: bind_group_layout,
-                primitive: PrimitiveState {
-                    front_face: FrontFace::Ccw,
-                    cull_mode: None,
-                    unclipped_depth: false,
-                    polygon_mode: PolygonMode::Fill,
-                    conservative: false,
-                    topology: PrimitiveTopology::LineList,
-                    strip_index_format: None,
-                },
-                depth_stencil: Some(DepthStencilState {
-                    format: TextureFormat::Depth32Float,
-                    depth_write_enabled,
-                    depth_compare: CompareFunction::Greater,
-                    stencil: StencilState {
-                        front: StencilFaceState::IGNORE,
-                        back: StencilFaceState::IGNORE,
-                        read_mask: 0,
-                        write_mask: 0,
-                    },
-                    bias: DepthBiasState {
-                        constant: 0,
-                        slope_scale: 0.0,
-                        clamp: 0.0,
-                    },
-                }),
-                multisample: MultisampleState {
-                    count: key.msaa_samples(),
-                    mask: !0,
-                    alpha_to_coverage_enabled: false,
-                },
-                label: Some(label),
-                push_constant_ranges: vec![],
-            })
-        }
+    pub(crate) fn from_handle(from: &MeshHandle) -> &Handle<Mesh> {
+        from
     }
 
-    #[allow(unused)]
-    pub(crate) fn queue(
-        opaque_3d_draw_functions: Res<DrawFunctions<Opaque3d>>,
-        debug_line_pipeline: Res<DebugLinePipeline>,
-        mut pipelines: ResMut<SpecializedMeshPipelines<DebugLinePipeline>>,
-        pipeline_cache: Res<PipelineCache>,
-        render_meshes: Res<RenderAssets<Mesh>>,
-        msaa: Res<Msaa>,
-        material_meshes: Query<(Entity, &MeshUniform, &Handle<Mesh>), With<RenderDebugLinesMesh>>,
-        config: Res<DebugLinesConfig>,
-        mut views: Query<(&ExtractedView, &mut RenderPhase<Opaque3d>)>,
-    ) {
-        let draw_custom = opaque_3d_draw_functions
-            .read()
-            .get_id::<DrawDebugLines>()
-            .unwrap();
-        let msaa_key = MeshPipelineKey::from_msaa_samples(msaa.samples());
-        for (view, mut transparent_phase) in views.iter_mut() {
-            let view_matrix = view.transform.compute_matrix();
-            let view_row_2 = view_matrix.row(2);
-            for (entity, mesh_uniform, mesh_handle) in material_meshes.iter() {
-                if let Some(mesh) = render_meshes.get(mesh_handle) {
-                    let mesh_key = msaa_key
-                        | MeshPipelineKey::from_primitive_topology(PrimitiveTopology::LineList)
-                        | MeshPipelineKey::from_hdr(view.hdr);
-                    let pipeline = pipelines
-                        .specialize(
-                            &pipeline_cache,
-                            &debug_line_pipeline,
-                            (config.depth_test, mesh_key),
-                            &mesh.layout,
-                        )
-                        .unwrap();
-                    transparent_phase.add(Opaque3d {
-                        entity,
-                        pipeline,
-                        draw_function: draw_custom,
-                        distance: view_row_2.dot(mesh_uniform.transform.col(3)),
-                    });
-                }
-            }
-        }
+    pub(crate) fn into_handle(from: Handle<Mesh>) -> MeshHandle {
+        from
     }
-
-    pub(crate) type DrawDebugLines = (
-        SetItemPipeline,
-        SetMeshViewBindGroup<0>,
-        SetMeshBindGroup<1>,
-        DrawMesh,
-    );
+    pub(crate) const DIMMENSION: &str = "3d";
 }
 
-pub mod r2d {
-    use bevy::render::view::{ExtractedView, ViewTarget};
-    use bevy::{
-        asset::Handle,
-        core_pipeline::core_2d::Transparent2d,
-        prelude::*,
-        render::{
-            mesh::MeshVertexBufferLayout,
-            render_asset::RenderAssets,
-            render_phase::{DrawFunctions, RenderPhase, SetItemPipeline},
-            render_resource::{
-                BlendState, ColorTargetState, ColorWrites, FragmentState, FrontFace,
-                MultisampleState, PipelineCache, PolygonMode, PrimitiveState, PrimitiveTopology,
-                RenderPipelineDescriptor, Shader, SpecializedMeshPipeline,
-                SpecializedMeshPipelineError, SpecializedMeshPipelines, TextureFormat, VertexState,
-            },
-            texture::BevyDefault,
-            view::{Msaa, VisibleEntities},
-        },
-        sprite::{
-            DrawMesh2d, Mesh2dHandle, Mesh2dPipeline, Mesh2dPipelineKey, Mesh2dUniform,
-            SetMesh2dBindGroup, SetMesh2dViewBindGroup,
-        },
-        utils::FloatOrd,
-    };
+#[cfg(not(feature = "3d"))]
+mod dim {
+    use bevy::{asset::Handle, render::mesh::Mesh, sprite::Mesh2dHandle};
+    pub(crate) use bevy::core_pipeline::core_2d::Transparent2d as Phase;
 
-    use crate::{RenderDebugLinesMesh, DEBUG_LINES_SHADER_HANDLE};
+    pub(crate) use crate::render_dim::r2d::{DebugLinePipeline, DrawDebugLines, queue};
 
-    #[derive(Resource)]
-    pub(crate) struct DebugLinePipeline {
-        mesh_pipeline: Mesh2dPipeline,
-        shader: Handle<Shader>,
+    pub(crate) type MeshHandle = Mesh2dHandle;
+
+    pub(crate) fn from_handle(from: &MeshHandle) -> &Handle<Mesh> {
+        &from.0
     }
-    impl FromWorld for DebugLinePipeline {
-        fn from_world(render_world: &mut World) -> Self {
-            DebugLinePipeline {
-                mesh_pipeline: Mesh2dPipeline::from_world(render_world),
-                shader: DEBUG_LINES_SHADER_HANDLE.typed(),
-            }
+
+    pub(crate) fn into_handle(from: Handle<Mesh>) -> MeshHandle {
+        Mesh2dHandle(from)
+    }
+
+    pub(crate) const DIMMENSION: &str = "2d";
+}
+
+// See debuglines.wgsl for explanation on 2 shaders.
+//pub(crate) const SHADER_FILE: &str = include_str!("debuglines.wgsl");
+pub(crate) const DEBUG_LINES_SHADER_HANDLE: Handle<Shader> =
+    Handle::weak_from_u128(17477439189930443325);
+
+#[derive(Resource)]
+pub(crate) struct DebugLinesConfig {
+    depth_test: bool,
+}
+
+#[derive(Resource)]
+pub(crate) struct DebugLinesRenderLayer {
+    render_layers: Vec<u8>,
+}
+
+/// The `SystemSet` in which the debug lines update system runs.
+///
+/// This set is nested in `CoreSet::PostUpdate`, so it runs after all update systems.
+#[derive(SystemSet, Debug, Hash, PartialEq, Eq, Clone)]
+pub enum DebugLinesSet {
+    DrawLines,
+}
+
+/// Bevy plugin, for initializing stuff.
+///
+/// # Usage
+///
+/// ```
+/// use bevy::prelude::*;
+/// use bevy_prototype_debug_lines::*;
+///
+/// App::new()
+///     .add_plugins(DefaultPlugins)
+///     .add_plugins(DebugLinesPlugin::default())
+///     .run();
+/// ```
+///
+/// Alternatively, you can initialize the plugin with depth testing, so that
+/// debug lines cut through geometry. To do this, use [`DebugLinesPlugin::with_depth_test(true)`].
+/// ```
+/// use bevy::prelude::*;
+/// use bevy_prototype_debug_lines::*;
+///
+/// App::new()
+///     .add_plugins(DefaultPlugins)
+///     .add_plugins(DebugLinesPlugin::with_depth_test(true))
+///     .run();
+/// ```
+/// The [`RenderLayers`] to which lines will be drawn can also be specified.
+/// ```
+/// use bevy::prelude::*;
+/// use bevy_prototype_debug_lines::*;
+///
+/// App::new()
+///     .add_plugins(DefaultPlugins)
+///     .add_plugins(DebugLinesPlugin::with_layers(vec![0, 1, 5]))
+///     .run();
+/// ```
+#[derive(Debug, Clone)]
+pub struct DebugLinesPlugin {
+    depth_test: bool,
+    render_layers: Vec<u8>,
+}
+
+impl Default for DebugLinesPlugin {
+    fn default() -> Self {
+        Self {
+            depth_test: false,
+            render_layers: vec![0], // All entitities are renderered in layer 0 if not otherwise specified.
+        }
+    }
+}
+
+impl DebugLinesPlugin {
+    /// Controls whether debug lines should be drawn with depth testing enabled
+    /// or disabled.
+    ///
+    /// # Arguments
+    ///
+    /// * `val` - True if lines should intersect with other geometry, or false
+    ///   if lines should always draw on top be drawn on top (the default).
+    pub fn with_depth_test(val: bool) -> Self {
+        Self {
+            depth_test: val,
+            ..default()
         }
     }
 
-    impl SpecializedMeshPipeline for DebugLinePipeline {
-        type Key = Mesh2dPipelineKey;
+    /// Controls which [`RenderLayers`] the debug line entity should belong to.
+    /// Cameras will only render entities on layers which intersect with the camera's own [`RenderLayers`] component.
+    /// If not specified, the debug line entity will be on layer 0 by default.
+    ///
+    /// # Arguments
+    ///
+    /// * `layers` - The list of rendering layers.
+    pub fn with_layers(layers: Vec<u8>) -> Self {
+        Self {
+            render_layers: layers,
+            ..default()
+        }
+    }
+}
 
-        fn specialize(
-            &self,
-            key: Self::Key,
-            layout: &MeshVertexBufferLayout,
-        ) -> Result<RenderPipelineDescriptor, SpecializedMeshPipelineError> {
-            let vertex_buffer_layout = layout.get_layout(&[
-                Mesh::ATTRIBUTE_POSITION.at_shader_location(0),
-                Mesh::ATTRIBUTE_COLOR.at_shader_location(1),
-            ])?;
+impl Plugin for DebugLinesPlugin {
+    fn build(&self, app: &mut App) {
+        use bevy::render::{render_resource::SpecializedMeshPipelines, RenderApp, RenderSet};
 
-            Ok(RenderPipelineDescriptor {
-                vertex: VertexState {
-                    shader: self.shader.clone_weak(),
-                    entry_point: "vertex".into(),
-                    shader_defs: vec![],
-                    buffers: vec![vertex_buffer_layout],
-                },
-                fragment: Some(FragmentState {
-                    shader: self.shader.clone_weak(),
-                    shader_defs: vec![],
-                    entry_point: "fragment".into(),
-                    targets: vec![Some(ColorTargetState {
-                        format: if key.contains(Mesh2dPipelineKey::HDR) {
-                            ViewTarget::TEXTURE_FORMAT_HDR
-                        } else {
-                            TextureFormat::bevy_default()
-                        },
-                        blend: Some(BlendState::ALPHA_BLENDING),
-                        write_mask: ColorWrites::ALL,
-                    })],
-                }),
-                layout: vec![self.mesh_pipeline.view_layout.clone()],
-                primitive: PrimitiveState {
-                    front_face: FrontFace::Ccw,
-                    cull_mode: None,
-                    unclipped_depth: false,
-                    polygon_mode: PolygonMode::Fill,
-                    conservative: false,
-                    topology: PrimitiveTopology::LineList,
-                    strip_index_format: None,
-                },
-                depth_stencil: None,
-                multisample: MultisampleState {
-                    count: key.msaa_samples(),
-                    mask: !0,
-                    alpha_to_coverage_enabled: false,
-                },
-                label: None,
-                push_constant_ranges: vec![],
+        #[cfg(feature = "3d")]
+        {
+            bevy::log::info!("3d");
+            load_internal_asset!(app, DEBUG_LINES_SHADER_HANDLE, "debuglines.wgsl", Shader::from_wgsl);
+        }
+
+        #[cfg(not(feature = "3d"))]
+        {
+            bevy::log::info!("2d");
+            load_internal_asset!(app, DEBUG_LINES_SHADER_HANDLE, "debuglines2d.wgsl", Shader::from_wgsl);
+        }
+
+        app.init_resource::<DebugLines>();
+
+        #[cfg(feature = "shapes")]
+        app.init_resource::<DebugShapes>();
+
+        app.insert_resource(DebugLinesRenderLayer {
+            render_layers: self.render_layers.to_owned(),
+        });
+
+        app.add_systems(Startup, setup)
+            // .add_systems(PostUpdate, (update, inspect_entities).in_set(DebugLinesSet::DrawLines));
+            .add_systems(PostUpdate, update.in_set(DebugLinesSet::DrawLines));
+
+        app.sub_app_mut(RenderApp)
+            .add_render_command::<dim::Phase, dim::DrawDebugLines>()
+            .insert_resource(DebugLinesConfig {
+                depth_test: self.depth_test,
             })
-        }
+            .init_resource::<SpecializedMeshPipelines<dim::DebugLinePipeline>>()
+            .add_systems(ExtractSchedule, extract)
+            .add_systems(Render, dim::queue.in_set(RenderSet::Queue));
+
+        info!("Loaded {} debug lines plugin.", dim::DIMMENSION);
     }
 
-    #[allow(unused)]
-    pub(crate) fn queue(
-        draw2d_functions: Res<DrawFunctions<Transparent2d>>,
-        debug_line_pipeline: Res<DebugLinePipeline>,
-        pipeline_cache: Res<PipelineCache>,
-        mut specialized_pipelines: ResMut<SpecializedMeshPipelines<DebugLinePipeline>>,
-        render_meshes: Res<RenderAssets<Mesh>>,
-        msaa: Res<Msaa>,
-        material_meshes: Query<(&Mesh2dUniform, &Mesh2dHandle), With<RenderDebugLinesMesh>>,
-        mut views: Query<(
-            &ExtractedView,
-            &VisibleEntities,
-            &mut RenderPhase<Transparent2d>,
-        )>,
-    ) {
-        for (view, visible_entities, mut phase) in views.iter_mut() {
-            let draw_mesh2d = draw2d_functions.read().get_id::<DrawDebugLines>().unwrap();
-            let msaa_key = Mesh2dPipelineKey::from_msaa_samples(msaa.samples());
+    // We can't add the pipeline to the app until after the render app has been initialized.
+    fn finish(&self, app: &mut App) {
+        use bevy::render::RenderApp;
 
-            for visible_entity in &visible_entities.entities {
-                if let Ok((_uniform, mesh_handle)) = material_meshes.get(*visible_entity) {
-                    if let Some(mesh) = render_meshes.get(&mesh_handle.0) {
-                        let mesh_key = msaa_key
-                            | Mesh2dPipelineKey::from_primitive_topology(
-                                PrimitiveTopology::LineList,
-                            )
-                            | Mesh2dPipelineKey::from_hdr(view.hdr);
-                        let pipeline = specialized_pipelines
-                            .specialize(
-                                &pipeline_cache,
-                                &debug_line_pipeline,
-                                mesh_key,
-                                &mesh.layout,
-                            )
-                            .unwrap();
-                        phase.add(Transparent2d {
-                            entity: *visible_entity,
-                            draw_function: draw_mesh2d,
-                            pipeline,
-                            sort_key: FloatOrd(f32::INFINITY),
-                            batch_range: None,
-                        });
-                    }
+        app.get_sub_app_mut(RenderApp)
+            .unwrap()
+            .init_resource::<dim::DebugLinePipeline>();
+    }
+}
+
+// Number of meshes to separate line buffers into.
+// We don't really do culling currently but this is a gateway to that.
+const MESH_COUNT: usize = 4;
+// Maximum number of points for each individual mesh.
+const MAX_POINTS_PER_MESH: usize = 2_usize.pow(16);
+const _MAX_LINES_PER_MESH: usize = MAX_POINTS_PER_MESH / 2;
+/// Maximum number of points.
+pub const MAX_POINTS: usize = MAX_POINTS_PER_MESH * MESH_COUNT;
+/// Maximum number of unique lines to draw at once.
+pub const MAX_LINES: usize = MAX_POINTS / 2;
+
+fn setup(mut cmds: Commands, mut meshes: ResMut<Assets<Mesh>>, config: Res<DebugLinesRenderLayer>) {
+    // Spawn a bunch of meshes to use for lines.
+    for i in 0..MESH_COUNT {
+        // Create a new mesh with the number of vertices we need.
+        let mut mesh = Mesh::new(PrimitiveTopology::LineList);
+        mesh.insert_attribute(
+            Mesh::ATTRIBUTE_POSITION,
+            VertexAttributeValues::Float32x3(Vec::with_capacity(MAX_POINTS_PER_MESH)),
+        );
+        mesh.insert_attribute(
+            Mesh::ATTRIBUTE_COLOR,
+            VertexAttributeValues::Float32x4(Vec::with_capacity(MAX_POINTS_PER_MESH)),
+        );
+        // https://github.com/Toqozz/bevy_debug_lines/issues/16
+        //mesh.set_indices(Some(Indices::U16(Vec::with_capacity(MAX_POINTS_PER_MESH))));
+
+        cmds.spawn((
+            TransformBundle::default(),
+            VisibilityBundle::default(),
+            dim::into_handle(meshes.add(mesh)),
+            NotShadowReceiver,
+            TransmittedShadowReceiver,
+            NotShadowCaster,
+            NoAutomaticBatching,
+            DebugLinesMesh(i),
+            NoFrustumCulling, // disable frustum culling
+            RenderLayers::from_layers(config.render_layers.as_slice()),
+        ));
+    }
+}
+
+fn update(
+    debug_line_meshes: Query<(&dim::MeshHandle, &DebugLinesMesh)>,
+    time: Res<Time>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut lines: ResMut<DebugLines>,
+    mut shapes: ResMut<DebugShapes>,
+) {
+    // Add lines from shapes
+    #[cfg(feature = "shapes")]
+    {
+        for shape in &shapes.shapes {
+            shape.add_lines(&mut lines);
+        }
+        shapes.shapes.clear();
+    }
+
+    // For each debug line mesh, fill its buffers with the relevant positions/colors chunks.
+    for (mesh_handle, debug_lines_idx) in debug_line_meshes.iter() {
+        let mesh = meshes.get_mut(dim::from_handle(mesh_handle)).unwrap();
+        use VertexAttributeValues::{Float32x3, Float32x4};
+        if let Some(Float32x3(vbuffer)) = mesh.attribute_mut(Mesh::ATTRIBUTE_POSITION) {
+            vbuffer.clear();
+            if lines.enabled {
+                if let Some(new_content) = lines
+                    .positions
+                    .chunks(MAX_POINTS_PER_MESH)
+                    .nth(debug_lines_idx.0)
+                {
+                    vbuffer.extend(new_content);
                 }
             }
         }
+
+        if let Some(Float32x4(cbuffer)) = mesh.attribute_mut(Mesh::ATTRIBUTE_COLOR) {
+            cbuffer.clear();
+            if lines.enabled {
+                if let Some(new_content) = lines
+                    .colors
+                    .chunks(MAX_POINTS_PER_MESH)
+                    .nth(debug_lines_idx.0)
+                {
+                    cbuffer.extend(new_content);
+                }
+            }
+        }
+
+        /*
+        // https://github.com/Toqozz/bevy_debug_lines/issues/16
+        if let Some(Indices::U16(indices)) = mesh.indices_mut() {
+            indices.clear();
+            if let Some(new_content) = lines.durations.chunks(_MAX_LINES_PER_MESH).nth(debug_lines_idx.0) {
+                indices.extend(
+                    new_content.iter().enumerate().map(|(i, _)| i as u16).flat_map(|i| [i * 2, i*2 + 1])
+                );
+            }
+        }
+        */
     }
 
-    pub(crate) type DrawDebugLines = (
-        SetItemPipeline,
-        SetMesh2dViewBindGroup<0>,
-        SetMesh2dBindGroup<1>,
-        DrawMesh2d,
-    );
+    // Processes stuff like getting rid of expired lines and stuff.
+    lines.update(time.delta_seconds());
+}
+
+/// Move the DebugLinesMesh marker Component to the render context.
+fn extract(mut commands: Commands, query: Extract<Query<Entity, With<DebugLinesMesh>>>) {
+    for entity in query.iter() {
+        bevy::log::info!("Extracting mesh");
+        commands.get_or_spawn(entity).insert(RenderDebugLinesMesh);
+    }
+}
+
+/// Marker component for the debug lines mesh in the world.
+#[derive(Component)]
+pub struct DebugLinesMesh(usize);
+
+#[derive(Component)]
+struct RenderDebugLinesMesh;
+
+/// Bevy resource providing facilities to draw lines.
+///
+/// # Usage
+/// ```
+/// use bevy::prelude::*;
+/// use bevy_prototype_debug_lines::*;
+///
+/// // Draws 3 horizontal lines, which disappear after 1 frame.
+/// fn some_system(mut lines: ResMut<DebugLines>) {
+///     lines.line(Vec3::new(-1.0, 1.0, 0.0), Vec3::new(1.0, 1.0, 0.0), 0.0);
+///     lines.line_colored(
+///         Vec3::new(-1.0, 0.0, 0.0),
+///         Vec3::new(1.0, 0.0, 0.0),
+///         0.0,
+///         Color::WHITE
+///     );
+///     lines.line_gradient(
+///         Vec3::new(-1.0, -1.0, 0.0),
+///         Vec3::new(1.0, -1.0, 0.0),
+///         0.0,
+///         Color::WHITE, Color::PINK
+///     );
+/// }
+/// ```
+#[derive(Resource)]
+pub struct DebugLines {
+    pub enabled: bool,
+    pub positions: Vec<[f32; 3]>,
+    pub colors: Vec<[f32; 4]>,
+    pub durations: Vec<f32>,
+}
+
+impl Default for DebugLines {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            positions: vec![],
+            colors: vec![],
+            durations: vec![],
+        }
+    }
+}
+
+impl DebugLines {
+    /// Draw a line in world space, or update an existing line
+    ///
+    /// # Arguments
+    ///
+    /// * `start` - The start of the line in world space
+    /// * `end` - The end of the line in world space
+    /// * `duration` - Duration (in seconds) that the line should show for -- a value of
+    ///   zero will show the line for 1 frame.
+    pub fn line(&mut self, start: Vec3, end: Vec3, duration: f32) {
+        self.line_colored(start, end, duration, Color::WHITE);
+    }
+
+    /// Draw a line in world space with a specified color, or update an existing line
+    ///
+    /// # Arguments
+    ///
+    /// * `start` - The start of the line in world space
+    /// * `end` - The end of the line in world space
+    /// * `duration` - Duration (in seconds) that the line should show for -- a value of
+    ///   zero will show the line for 1 frame.
+    /// * `color` - Line color
+    pub fn line_colored(&mut self, start: Vec3, end: Vec3, duration: f32, color: Color) {
+        self.line_gradient(start, end, duration, color, color);
+    }
+
+    /// Draw a line in world space with a specified gradient color, or update an existing line
+    ///
+    /// # Arguments
+    ///
+    /// * `start` - The start of the line in world space
+    /// * `end` - The end of the line in world space
+    /// * `duration` - Duration (in seconds) that the line should show for -- a value of
+    ///   zero will show the line for 1 frame.
+    /// * `start_color` - Line color
+    /// * `end_color` - Line color
+    pub fn line_gradient(
+        &mut self,
+        start: Vec3,
+        end: Vec3,
+        duration: f32,
+        start_color: Color,
+        end_color: Color,
+    ) {
+        if self.positions.len() >= MAX_POINTS {
+            warn!("Tried to add a new line when existing number of lines was already at maximum, ignoring.");
+            return;
+        }
+
+        self.positions.push(start.into());
+        self.positions.push(end.into());
+        self.colors.push(start_color.as_linear_rgba_f32());
+        self.colors.push(end_color.as_linear_rgba_f32());
+        self.durations.push(duration);
+    }
+
+    // Returns the indices of the start and end positions of the nth line.
+    // The indices can also be used to access color data.
+    fn nth(&self, idx: usize) -> (usize, usize) {
+        let i = idx * 2;
+        (i, i + 1)
+    }
+
+    // Prepare [`ImmediateLinesStorage`] and [`RetainedLinesStorage`] for next
+    // frame.
+    // This clears the immediate mod buffers and tells the retained mode
+    // buffers to recompute expired lines list.
+    fn update(&mut self, dt: f32) {
+        // TODO: an actual line counter wouldn't hurt.
+        let mut i = 0;
+        let mut len = self.durations.len();
+        while i != len {
+            self.durations[i] -= dt;
+            // <= instead of < is fine here because this is always called AFTER sending the
+            // data to the mesh, so we're guaranteed at least a frame here.
+            if self.durations[i] <= 0.0 {
+                let (cur_s, cur_e) = self.nth(i);
+                let (last_s, last_e) = self.nth(len - 1);
+                self.positions.swap(cur_s, last_s);
+                self.positions.swap(cur_e, last_e);
+                self.colors.swap(cur_s, last_s);
+                self.colors.swap(cur_e, last_e);
+                self.durations.swap(i, len - 1);
+                len -= 1;
+            } else {
+                i += 1;
+            }
+        }
+
+        self.positions.truncate(len * 2);
+        self.colors.truncate(len * 2);
+        self.durations.truncate(len);
+    }
 }
